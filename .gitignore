@@ -427,3 +427,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Local settings for Claude, the AI assistant in Visual Studio
+.claude/settings.local.json
