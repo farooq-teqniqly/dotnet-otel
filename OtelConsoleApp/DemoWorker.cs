@@ -10,7 +10,7 @@ namespace OtelConsoleApp;
 /// logs, traces, and metrics. Processes one order every three seconds until cancelled.
 /// Every seventh order throws intentionally to produce error spans.
 /// </summary>
-internal sealed class DemoWorker : BackgroundService
+internal sealed partial class DemoWorker : BackgroundService
 {
     /// <summary>Tracks the number of orders currently in-flight.</summary>
     private static readonly UpDownCounter<int> ActiveOrders =
@@ -34,6 +34,7 @@ internal sealed class DemoWorker : BackgroundService
             "ms",
             "Order processing duration"
         );
+
     private readonly ILogger<DemoWorker> _logger;
 
     /// <summary>Initializes a new instance of <see cref="DemoWorker"/>.</summary>
@@ -43,7 +44,7 @@ internal sealed class DemoWorker : BackgroundService
     /// <inheritdoc/>
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        _logger.LogInformation("DemoWorker starting. Press Ctrl+C to stop");
+        LogWorkerStarting(_logger);
 
         var orderId = 0;
         while (!ct.IsCancellationRequested)
@@ -53,7 +54,58 @@ internal sealed class DemoWorker : BackgroundService
             await Task.Delay(TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
         }
 
-        _logger.LogInformation("DemoWorker stopped");
+        LogWorkerStopped(_logger);
+    }
+
+    [LoggerMessage(
+        Level = LogLevel.Information,
+        Message = "Order {OrderId} completed in {ElapsedMs}ms"
+    )]
+    private static partial void LogOrderCompleted(ILogger logger, int orderId, long elapsedMs);
+
+    [LoggerMessage(Level = LogLevel.Error, Message = "Order {OrderId} failed after {ElapsedMs}ms")]
+    private static partial void LogOrderFailed(
+        ILogger logger,
+        Exception ex,
+        int orderId,
+        long elapsedMs
+    );
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "Order {OrderId} fulfilled")]
+    private static partial void LogOrderFulfilled(ILogger logger, int orderId);
+
+    [LoggerMessage(
+        Level = LogLevel.Information,
+        Message = "Processing order {OrderId} (type={OrderType})"
+    )]
+    private static partial void LogProcessingOrder(ILogger logger, int orderId, string orderType);
+
+    [LoggerMessage(
+        Level = LogLevel.Information,
+        Message = "DemoWorker starting. Press Ctrl+C to stop"
+    )]
+    private static partial void LogWorkerStarting(ILogger logger);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "DemoWorker stopped")]
+    private static partial void LogWorkerStopped(ILogger logger);
+
+    /// <summary>
+    /// Validates the order inside a child <c>ValidateOrder</c> span.
+    /// Throws <see cref="InvalidOperationException"/> for every seventh order to simulate failures.
+    /// </summary>
+    /// <param name="orderId">Order identifier.</param>
+    /// <param name="ct">Cancellation token.</param>
+    private static async Task ValidateOrderAsync(int orderId, CancellationToken ct)
+    {
+        using var activity = Telemetry.ActivitySource.StartActivity();
+        activity?.SetTag("order.id", orderId);
+
+        await Task.Delay(Random.Shared.Next(10, 50), ct).ConfigureAwait(false);
+
+        if (orderId % 7 == 0)
+            throw new InvalidOperationException(
+                $"Order {orderId} failed validation: inventory unavailable"
+            );
     }
 
     /// <summary>
@@ -64,11 +116,11 @@ internal sealed class DemoWorker : BackgroundService
     /// <param name="ct">Cancellation token.</param>
     private async Task FulfillOrderAsync(int orderId, CancellationToken ct)
     {
-        using var activity = Telemetry.ActivitySource.StartActivity("FulfillOrder");
+        using var activity = Telemetry.ActivitySource.StartActivity();
         activity?.SetTag("order.id", orderId);
 
         await Task.Delay(Random.Shared.Next(50, 150), ct).ConfigureAwait(false);
-        _logger.LogDebug("Order {OrderId} fulfilled", orderId);
+        LogOrderFulfilled(_logger, orderId);
     }
 
     /// <summary>
@@ -79,18 +131,15 @@ internal sealed class DemoWorker : BackgroundService
     /// <param name="ct">Cancellation token.</param>
     private async Task ProcessOrderAsync(int orderId, CancellationToken ct)
     {
-        using var activity = Telemetry.ActivitySource.StartActivity("ProcessOrder");
+        using var activity = Telemetry.ActivitySource.StartActivity();
         activity?.SetTag("order.id", orderId);
-        activity?.SetTag("order.type", orderId % 2 == 0 ? "express" : "standard");
+        var orderType = orderId % 2 == 0 ? "express" : "standard";
+        activity?.SetTag("order.type", orderType);
 
         var sw = Stopwatch.StartNew();
         ActiveOrders.Add(1);
 
-        _logger.LogInformation(
-            "Processing order {OrderId} (type={OrderType})",
-            orderId,
-            orderId % 2 == 0 ? "express" : "standard"
-        );
+        LogProcessingOrder(_logger, orderId, orderType);
 
         try
         {
@@ -99,23 +148,14 @@ internal sealed class DemoWorker : BackgroundService
 
             activity?.SetStatus(ActivityStatusCode.Ok);
             OrdersProcessed.Add(1, new TagList { { "status", "success" } });
-            _logger.LogInformation(
-                "Order {OrderId} completed in {ElapsedMs}ms",
-                orderId,
-                sw.ElapsedMilliseconds
-            );
+            LogOrderCompleted(_logger, orderId, sw.ElapsedMilliseconds);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
             activity?.AddException(ex);
             OrdersProcessed.Add(1, new TagList { { "status", "error" } });
-            _logger.LogError(
-                ex,
-                "Order {OrderId} failed after {ElapsedMs}ms",
-                orderId,
-                sw.ElapsedMilliseconds
-            );
+            LogOrderFailed(_logger, ex, orderId, sw.ElapsedMilliseconds);
         }
         finally
         {
@@ -126,24 +166,5 @@ internal sealed class DemoWorker : BackgroundService
                 new TagList { { "order.type", orderId % 2 == 0 ? "express" : "standard" } }
             );
         }
-    }
-
-    /// <summary>
-    /// Validates the order inside a child <c>ValidateOrder</c> span.
-    /// Throws <see cref="InvalidOperationException"/> for every seventh order to simulate failures.
-    /// </summary>
-    /// <param name="orderId">Order identifier.</param>
-    /// <param name="ct">Cancellation token.</param>
-    private async Task ValidateOrderAsync(int orderId, CancellationToken ct)
-    {
-        using var activity = Telemetry.ActivitySource.StartActivity("ValidateOrder");
-        activity?.SetTag("order.id", orderId);
-
-        await Task.Delay(Random.Shared.Next(10, 50), ct).ConfigureAwait(false);
-
-        if (orderId % 7 == 0)
-            throw new InvalidOperationException(
-                $"Order {orderId} failed validation: inventory unavailable"
-            );
     }
 }
